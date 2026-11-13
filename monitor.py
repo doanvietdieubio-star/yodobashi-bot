@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Theo dõi bình luận mới trên https://gamenv.net/tc/yodobashi/ (WordPress + wpDiscuz) -> Discord Webhook."""
+"""Theo dõi bình luận mới trên https://gamenv.net/tc/yodobashi/ (WordPress + wpDiscuz) -> Discord Webhook.
+
+Nhận diện chi nhánh qua emoji/từ viết tắt trong nội dung, dịch ký hiệu tình trạng hàng (🍐/🐜),
+và dịch nội dung Nhật -> Việt bằng deep-translator (Google Translate, miễn phí).
+"""
 import json
 import os
 import re
@@ -9,6 +13,11 @@ from pathlib import Path
 
 import requests
 from playwright.sync_api import sync_playwright
+
+try:
+    from deep_translator import GoogleTranslator
+except ImportError:  # vẫn chạy được nếu thiếu thư viện
+    GoogleTranslator = None
 
 # ----------------------------- CẤU HÌNH -----------------------------
 TARGET_URL = os.getenv("TARGET_URL", "https://gamenv.net/tc/yodobashi/").strip()
@@ -22,29 +31,41 @@ DEBUG_DIR = Path("debug")
 MAX_SEEN = 1000
 EMBED_COLOR = 0xE60012
 
-# (regex trên alt/title/class/text/tên file ảnh của icon, tên hiển thị). Chỉnh theo dữ liệu thật trong debug/.
-BRANCH_RULES = [
-    (r"akiba|akihabara|秋葉原|秋葉", "Yodobashi Akiba (Akihabara)"),
-    (r"shinjuku[-_ ]?(west|nishi)|新宿西", "Yodobashi Shinjuku Nishiguchi"),
-    (r"shinjuku|新宿", "Yodobashi Shinjuku"),
-    (r"umeda|梅田", "Yodobashi Umeda (Osaka)"),
-    (r"yokohama|横浜", "Yodobashi Yokohama"),
-    (r"kyoto|京都", "Yodobashi Kyoto"),
-    (r"nagoya|名古屋|meieki", "Yodobashi Nagoya"),
-    (r"hakata|博多", "Yodobashi Hakata"),
-    (r"sapporo|札幌", "Yodobashi Sapporo"),
-    (r"sendai|仙台", "Yodobashi Sendai"),
-    (r"kichijoji|吉祥寺", "Yodobashi Kichijoji"),
-    (r"ikebukuro|池袋", "Yodobashi Ikebukuro"),
-    (r"chiba|千葉", "Yodobashi Chiba"),
-    (r"tachikawa|立川", "Yodobashi Tachikawa"),
-    (r"fuji|富士", "Yodobashi (huy hiệu núi Phú Sĩ - chưa rõ chi nhánh)"),
+TRANSLATE = os.getenv("TRANSLATE", "true").lower() == "true"
+MAX_TRANSLATE_CHARS = 4500
+
+# Từ điển chi nhánh: (danh sách emoji / từ viết tắt, tên hiển thị). Có thể thêm/sửa tùy ý.
+BRANCH_KEYWORDS = [
+    (["⛱️", "横ヨド"], "Yodobashi Yokohama"),
+    (["🦉"], "Yodobashi Ikebukuro"),
+    (["🐝"], "Yodobashi Hachioji"),
+    (["🥟"], "Yodobashi Utsunomiya"),
+    (["🥜"], "Yodobashi Chiba"),
+    (["🦏", "🥚"], "Yodobashi Saitama Shintoshin"),
+    (["🗻"], "Yodobashi Shinjuku / Kofu"),
+    (["🔞"], "Yodobashi Shinjuku / Akihabara"),
+    (["アキヨド"], "Yodobashi Akihabara"),
+    (["梅田", "🐙"], "Yodobashi Umeda (Osaka)"),
+    (["博多", "🍜"], "Yodobashi Hakata (Fukuoka)"),
+    (["札幌", "⛄"], "Yodobashi Sapporo"),
+    (["仙台", "🐮"], "Yodobashi Sendai"),
+    (["錦糸町"], "Yodobashi Kinshicho"),
+    (["上野", "🐼"], "Yodobashi Ueno"),
+    (["町田"], "Yodobashi Machida"),
+    (["川崎"], "Yodobashi Kawasaki"),
+    (["京都", "⛩️"], "Yodobashi Kyoto"),
 ]
+# Mở rộng nhanh qua biến môi trường: BRANCH_MAP_JSON='{"🐸": "Yodobashi Tên mới"}'
 try:
-    _extra = json.loads(os.getenv("BRANCH_MAP_JSON", "{}"))
-    BRANCH_RULES = [(k, v) for k, v in _extra.items()] + BRANCH_RULES
-except json.JSONDecodeError:
+    for _kw, _name in json.loads(os.getenv("BRANCH_MAP_JSON", "{}")).items():
+        BRANCH_KEYWORDS.append(([_kw], _name))
+except (json.JSONDecodeError, AttributeError):
     print("⚠️ BRANCH_MAP_JSON không hợp lệ, bỏ qua.")
+
+NO_BRANCH_TEXT = "Xem trong nội dung"
+# "あり" nhưng loại trừ ありがとう / ありません / ありえない / ありそう
+ARI_RE = re.compile(r"あり(?!が|ませ|え|そう)")
+JP_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9f]")
 
 # ----------------------------- JS TRÍCH XUẤT -----------------------------
 EXTRACT_JS = r"""
@@ -165,21 +186,52 @@ def parse_cookie_header(header, url):
     return cookies
 
 
-def resolve_branch(badges):
-    blob_parts, has_visual = [], False
-    for b in badges:
-        fname = (b.get("src") or "").split("?")[0].rsplit("/", 1)[-1]
-        blob_parts += [b.get("alt", ""), b.get("title", ""), b.get("cls", ""), b.get("text", ""), fname]
-        if b.get("src"):
-            has_visual = True
-    blob = " ".join(blob_parts).lower()
-    for pattern, name in BRANCH_RULES:
-        if re.search(pattern, blob, re.I):
-            return name
-    if has_visual:
-        hint = next((b.get("title") or b.get("alt") or b["src"].split("/")[-1] for b in badges if b.get("src")), "")
-        return f"Chưa nhận diện được icon ({hint[:60]})"
-    return "Không rõ chi nhánh"
+def _norm(t):
+    """Bỏ variation selector để ⛱ và ⛱️ (⛩ và ⛩️) khớp nhau."""
+    return (t or "").replace("\ufe0f", "").replace("\ufe0e", "")
+
+
+def find_branches(text):
+    """Trả về chuỗi tên chi nhánh (có thể nhiều chi nhánh, theo thứ tự xuất hiện trong bình luận)."""
+    t = _norm(text)
+    hits = []
+    for keywords, name in BRANCH_KEYWORDS:
+        found = [(t.find(_norm(k)), k) for k in keywords if _norm(k) and _norm(k) in t]
+        if found:
+            found.sort()
+            hits.append((found[0][0], name, [k for _, k in found]))
+    if not hits:
+        return NO_BRANCH_TEXT
+    hits.sort(key=lambda x: x[0])
+    return "\n".join(f"{name} ({' / '.join(kws)})" for _, name, kws in hits)
+
+
+def stock_notes(text):
+    """Dịch ký hiệu tình trạng hàng: 🍐 = hết hàng (nashi), 🐜 / あり = có hàng (ari)."""
+    t = _norm(text)
+    notes = []
+    if "🍐" in t:
+        notes.append("[❌ Hết hàng (🍐)]")
+    if "🐜" in t:
+        notes.append("[✅ Có hàng (🐜)]")
+    elif ARI_RE.search(t):
+        notes.append("[✅ Có hàng (あり)]")
+    return " ".join(notes)
+
+
+def translate_ja_vi(text):
+    """Dịch Nhật -> Việt bằng Google Translate (deep-translator). Lỗi thì trả chuỗi rỗng."""
+    if not TRANSLATE or GoogleTranslator is None or not text or not JP_RE.search(text):
+        return ""
+    src = text[:MAX_TRANSLATE_CHARS]
+    for attempt in range(3):
+        try:
+            out = (GoogleTranslator(source="ja", target="vi").translate(src) or "").strip()
+            return "" if out == text.strip() else out
+        except Exception as e:  # rate limit / mạng
+            print(f"⚠️ Dịch lỗi (lần {attempt + 1}): {e}")
+            time.sleep(1.5 * (attempt + 1))
+    return ""
 
 
 def upgrade_image(ctx, url):
@@ -270,14 +322,18 @@ def post_discord(embeds):
     return False
 
 
-def build_messages(c, branch):
+def build_messages(c, branch, stock="", translation=""):
     link, imgs = c["permalink"], c["images"]
     fields = [
-        {"name": "🏪 Chi nhánh Yodobashi", "value": clip(branch, 1024), "inline": True},
+        {"name": "🏪 Chi nhánh", "value": clip(branch, 1024), "inline": True},
         {"name": "👤 Người đăng", "value": clip(c["author"] or "Ẩn danh", 1024), "inline": True},
         {"name": "🕒 Thời gian", "value": clip(c["date"] or c["date_text"] or "Không rõ", 1024), "inline": False},
-        {"name": "💬 Nội dung", "value": clip(c["text"] or "(không có nội dung chữ)", 1024), "inline": False},
     ]
+    if stock:
+        fields.append({"name": "📦 Tình trạng hàng", "value": clip(stock, 1024), "inline": False})
+    fields.append({"name": "💬 Nội dung gốc (🇯🇵)", "value": clip(c["text"] or "(không có nội dung chữ)", 1024), "inline": False})
+    if translation:
+        fields.append({"name": "🌐 Bản dịch tiếng Việt (🇻🇳)", "value": clip(translation, 1024), "inline": False})
     if imgs:
         fields.append({"name": "🖼️ Hình ảnh đính kèm", "value": f"{len(imgs)} ảnh (hiển thị bên dưới)", "inline": False})
     main = {"title": "🔔 Bình luận mới - Yodobashi", "url": link, "color": EMBED_COLOR,
@@ -327,8 +383,10 @@ def main():
     print(f"🆕 {len(new)} bình luận mới.")
 
     for c in new:
-        branch = resolve_branch(c["badges"])
-        ok = all(post_discord(m) for m in build_messages(c, branch))
+        branch = find_branches(c["text"])
+        stock = stock_notes(c["text"])
+        translation = translate_ja_vi(c["text"])
+        ok = all(post_discord(m) for m in build_messages(c, branch, stock, translation))
         if ok:
             seen.append(c["id"])
             save_state(seen)
